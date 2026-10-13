@@ -310,7 +310,7 @@ func (d *SchemaTracker) CreateMaterializedViewLog(ctx sessionctx.Context, s *ast
 		return err
 	}
 	if baseTable.IsView() || baseTable.IsSequence() || baseTable.TempTableType != model.TempTableNone ||
-		baseTable.MaterializedView != nil || baseTable.MaterializedViewLog != nil {
+		baseTable.MaterializedView != nil || baseTable.MaterializedViewShadow != nil || baseTable.MaterializedViewLog != nil {
 		return dbterror.ErrWrongObject.GenWithStackByArgs(schemaName, s.Table.Name, "BASE TABLE")
 	}
 	if baseTable.GetPartitionInfo() != nil {
@@ -362,6 +362,53 @@ func (*SchemaTracker) DropMaterializedView(sessionctx.Context, *ast.DropMaterial
 	return dbterror.ErrGeneralUnsupportedDDL.GenWithStack("DROP MATERIALIZED VIEW is not supported in schema tracker")
 }
 
+// AlterMaterializedView rejects MV alteration because the schema tracker does not support MVs.
+func (*SchemaTracker) AlterMaterializedView(sessionctx.Context, *ast.AlterMaterializedViewStmt) error {
+	return dbterror.ErrGeneralUnsupportedDDL.GenWithStack("ALTER MATERIALIZED VIEW is not supported in schema tracker")
+}
+
+// AlterMaterializedViewLog rejects MV log alteration because the schema tracker does not support MV logs.
+func (*SchemaTracker) AlterMaterializedViewLog(sessionctx.Context, *ast.AlterMaterializedViewLogStmt) error {
+	return dbterror.ErrGeneralUnsupportedDDL.GenWithStack("ALTER MATERIALIZED VIEW LOG is not supported in schema tracker")
+}
+
+// CreateMaterializedViewShadowTable implements the DDL interface.
+func (*SchemaTracker) CreateMaterializedViewShadowTable(
+	sessionctx.Context,
+	int64,
+	ast.CIStr,
+	*model.TableInfo,
+) error {
+	return dbterror.ErrGeneralUnsupportedDDL.GenWithStack("CREATE MATERIALIZED VIEW SHADOW TABLE is not supported in schema tracker")
+}
+
+// DropMaterializedViewShadowTable implements the DDL interface.
+func (*SchemaTracker) DropMaterializedViewShadowTable(
+	sessionctx.Context,
+	ast.CIStr,
+	ast.CIStr,
+) error {
+	return dbterror.ErrGeneralUnsupportedDDL.GenWithStack("DROP MATERIALIZED VIEW SHADOW TABLE is not supported in schema tracker")
+}
+
+// RefreshMaterializedViewCompleteOutOfPlaceCutover implements the DDL interface.
+func (*SchemaTracker) RefreshMaterializedViewCompleteOutOfPlaceCutover(
+	sessionctx.Context,
+	int64,
+	ast.CIStr,
+	ast.CIStr,
+	int64,
+	int64,
+	uint64,
+	*uint64,
+	uint64,
+	bool,
+	*int64,
+	bool,
+) error {
+	return dbterror.ErrGeneralUnsupportedDDL.GenWithStack("REFRESH MATERIALIZED VIEW COMPLETE OUT OF PLACE cutover is not supported in schema tracker")
+}
+
 // DropMaterializedViewLog implements the DDL interface.
 func (d *SchemaTracker) DropMaterializedViewLog(ctx sessionctx.Context, s *ast.DropMaterializedViewLogStmt) error {
 	schemaName := s.Table.Schema
@@ -381,7 +428,7 @@ func (d *SchemaTracker) DropMaterializedViewLog(ctx sessionctx.Context, s *ast.D
 		return err
 	}
 	if baseTable.IsView() || baseTable.IsSequence() || baseTable.TempTableType != model.TempTableNone ||
-		baseTable.MaterializedView != nil || baseTable.MaterializedViewLog != nil {
+		baseTable.MaterializedView != nil || baseTable.MaterializedViewShadow != nil || baseTable.MaterializedViewLog != nil {
 		return dbterror.ErrWrongObject.GenWithStackByArgs(schemaName, s.Table.Name, "BASE TABLE")
 	}
 

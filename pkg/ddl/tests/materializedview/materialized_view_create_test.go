@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package ddl_test
+package materializedview_test
 
 import (
 	"context"
@@ -20,17 +20,17 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/pkg/ddl"
 	ddlsess "github.com/pingcap/tidb/pkg/ddl/session"
+	ddlutil "github.com/pingcap/tidb/pkg/ddl/util"
 	"github.com/pingcap/tidb/pkg/kv"
+	"github.com/pingcap/tidb/pkg/meta"
 	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/ast"
-	"github.com/pingcap/tidb/pkg/parser/auth"
 	"github.com/pingcap/tidb/pkg/testkit"
 	"github.com/pingcap/tidb/pkg/testkit/testfailpoint"
 	"github.com/stretchr/testify/require"
@@ -40,344 +40,6 @@ func newMViewTestKit(t testing.TB, store kv.Storage) *testkit.TestKit {
 	tk := testkit.NewTestKit(t, store)
 	tk.MustExec("set tidb_mview_enable = on")
 	return tk
-}
-
-func TestCreateMaterializedViewLogPreSplitOptions(t *testing.T) {
-	store, dom := testkit.CreateMockStoreAndDomain(t)
-	tk := newMViewTestKit(t, store)
-	tk.MustExec("use test")
-	originSplit := atomic.LoadUint32(&ddl.EnableSplitTableRegion)
-	atomic.StoreUint32(&ddl.EnableSplitTableRegion, 1)
-	defer atomic.StoreUint32(&ddl.EnableSplitTableRegion, originSplit)
-	tk.MustExec("set @@session.tidb_scatter_region='table'")
-	tk.MustExec("create table t_mlog_presplit (a int, b int)")
-
-	tk.MustExec("create materialized view log on t_mlog_presplit (a) shard_row_id_bits = 2 pre_split_regions = 2 purge next date_add(now(), interval 1 hour)")
-
-	showCreate := tk.MustQuery("show create table `$mlog$t_mlog_presplit`").Rows()[0][1].(string)
-	require.Contains(t, showCreate, "SHARD_ROW_ID_BITS=2")
-	require.Contains(t, showCreate, "PRE_SPLIT_REGIONS=2")
-
-	is := dom.InfoSchema()
-	mlogTable, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("$mlog$t_mlog_presplit"))
-	require.NoError(t, err)
-	require.Equal(t, uint64(2), mlogTable.Meta().ShardRowIDBits)
-	require.Equal(t, uint64(2), mlogTable.Meta().PreSplitRegions)
-
-	regions := tk.MustQuery("show table `$mlog$t_mlog_presplit` regions").Rows()
-	regionNames := make([]string, 0, len(regions))
-	for _, row := range regions {
-		regionNames = append(regionNames, fmt.Sprint(row[1]))
-	}
-	require.Contains(t, regionNames, fmt.Sprintf("t_%d_r_2305843009213693952", mlogTable.Meta().ID))
-	require.Contains(t, regionNames, fmt.Sprintf("t_%d_r_4611686018427387904", mlogTable.Meta().ID))
-	require.Contains(t, regionNames, fmt.Sprintf("t_%d_r_6917529027641081856", mlogTable.Meta().ID))
-}
-
-func TestCreateMaterializedViewLogPurgeInfoNextUnixSecondsDerivation(t *testing.T) {
-	store, dom := testkit.CreateMockStoreAndDomain(t)
-	tk := newMViewTestKit(t, store)
-	tk.MustExec("use test")
-
-	getMLogID := func(baseTable string) int64 {
-		is := dom.InfoSchema()
-		mlogTable, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("$mlog$"+baseTable))
-		require.NoError(t, err)
-		return mlogTable.Meta().ID
-	}
-
-	tk.MustExec("create table t_purge_start_only (a int)")
-	tk.MustExec("create materialized view log on t_purge_start_only (a) purge start with date_add(now(), interval 40 minute) next date_add(now(), interval 20 minute)")
-	mlogStartOnlyID := getMLogID("t_purge_start_only")
-	tk.MustQuery(fmt.Sprintf(
-		"select NEXT_PURGE_UNIX_SECONDS is not null, NEXT_PURGE_UNIX_SECONDS > TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP() + interval 30 minute), NEXT_PURGE_UNIX_SECONDS < TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP() + interval 2 hour) from mysql.tidb_mlog_purge_info where MLOG_ID = %d",
-		mlogStartOnlyID,
-	)).Check(testkit.Rows("1 1 1"))
-
-	tk.MustExec("create table t_purge_next_only (a int)")
-	tk.MustExec("create materialized view log on t_purge_next_only (a) purge next date_add(now(), interval 20 minute)")
-	mlogNextOnlyID := getMLogID("t_purge_next_only")
-	tk.MustQuery(fmt.Sprintf(
-		"select NEXT_PURGE_UNIX_SECONDS is not null, NEXT_PURGE_UNIX_SECONDS > TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP() + interval 10 minute), NEXT_PURGE_UNIX_SECONDS < TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP() + interval 1 hour) from mysql.tidb_mlog_purge_info where MLOG_ID = %d",
-		mlogNextOnlyID,
-	)).Check(testkit.Rows("1 1 1"))
-
-	tk.MustExec("create table t_purge_no_schedule (a int)")
-	tk.MustExec("create materialized view log on t_purge_no_schedule (a)")
-	mlogNoScheduleID := getMLogID("t_purge_no_schedule")
-	tk.MustQuery(fmt.Sprintf(
-		"select NEXT_PURGE_UNIX_SECONDS is null from mysql.tidb_mlog_purge_info where MLOG_ID = %d",
-		mlogNoScheduleID,
-	)).Check(testkit.Rows("1"))
-
-	tk.MustExec("create table t_purge_near_now (a int)")
-	tk.MustExec("create materialized view log on t_purge_near_now (a) purge start with now() next date_add(now(), interval 40 minute)")
-	mlogNearNowID := getMLogID("t_purge_near_now")
-	tk.MustQuery(fmt.Sprintf(
-		"select NEXT_PURGE_UNIX_SECONDS is not null, NEXT_PURGE_UNIX_SECONDS > TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP() + interval 20 minute), NEXT_PURGE_UNIX_SECONDS < TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP() + interval 2 hour) from mysql.tidb_mlog_purge_info where MLOG_ID = %d",
-		mlogNearNowID,
-	)).Check(testkit.Rows("1 1 1"))
-}
-
-func TestCreateMaterializedViewLogPurgeInfoNextUnixSecondsUsesScheduleTimeZone(t *testing.T) {
-	store, dom := testkit.CreateMockStoreAndDomain(t)
-	tk := newMViewTestKit(t, store)
-	tk.MustExec("use test")
-	tk.MustExec("set time_zone = '+08:00'")
-
-	getMLogID := func(baseTable string) int64 {
-		is := dom.InfoSchema()
-		mlogTable, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("$mlog$"+baseTable))
-		require.NoError(t, err)
-		return mlogTable.Meta().ID
-	}
-
-	tk.MustExec("create table t_purge_schedule_next (a int)")
-	tk.MustExec("create materialized view log on t_purge_schedule_next (a) purge next cast('2030-01-02 10:00:00' as datetime)")
-	mlogNextID := getMLogID("t_purge_schedule_next")
-	tk.MustQuery(fmt.Sprintf(
-		"select NEXT_PURGE_UNIX_SECONDS = 1893549600, NEXT_PURGE_UNIX_SECONDS = 1893578400 from mysql.tidb_mlog_purge_info where MLOG_ID = %d",
-		mlogNextID,
-	)).Check(testkit.Rows("1 0"))
-
-	tk.MustExec("create table t_purge_schedule_start (a int)")
-	tk.MustExec("create materialized view log on t_purge_schedule_start (a) purge start with cast('2030-01-02 10:00:00' as datetime) next cast('2030-01-03 10:00:00' as datetime)")
-	mlogStartID := getMLogID("t_purge_schedule_start")
-	tk.MustQuery(fmt.Sprintf(
-		"select NEXT_PURGE_UNIX_SECONDS = 1893549600, NEXT_PURGE_UNIX_SECONDS = 1893636000 from mysql.tidb_mlog_purge_info where MLOG_ID = %d",
-		mlogStartID,
-	)).Check(testkit.Rows("1 0"))
-}
-
-func TestCreateMaterializedViewLogRejectNonBaseObject(t *testing.T) {
-	store := testkit.CreateMockStore(t)
-	tk := newMViewTestKit(t, store)
-	tk.MustExec("use test")
-	tk.MustExec("create table t (a int)")
-	tk.MustExec("create view v as select a from t")
-	tk.MustExec("create sequence s")
-	tk.MustExec("create global temporary table gt (a int) on commit delete rows")
-	tk.MustExec("create materialized view log on t (a)")
-	tk.MustExec("create table t_mv_base (a int not null, b int not null)")
-	tk.MustExec("create materialized view log on t_mv_base (a, b) purge next date_add(now(), interval 1 hour)")
-	tk.MustExec("create materialized view mv (a, cnt) refresh fast as select a, count(1) from t_mv_base group by a")
-
-	for _, testCase := range []struct {
-		sql  string
-		name string
-	}{
-		{"create materialized view log on v (a)", "v"},
-		{"create materialized view log on s (a)", "s"},
-		{"create materialized view log on gt (a)", "gt"},
-		{"create materialized view log on mysql.user (User)", "user"},
-		{"create materialized view log on information_schema.tables (TABLE_SCHEMA)", "tables"},
-		{"create materialized view log on mv (a, cnt)", "mv"},
-	} {
-		err := tk.ExecToErr(testCase.sql)
-		require.Error(t, err, testCase.sql)
-		require.Contains(t, err.Error(), "is not BASE TABLE")
-	}
-	tk.MustExec("create table t_mlog_base (a int)")
-	tk.MustExec("create materialized view log on t_mlog_base (a)")
-	err := tk.ExecToErr("create materialized view log on `$mlog$t_mlog_base` (a)")
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "is not BASE TABLE")
-}
-
-func TestCreateMaterializedViewLogUpdatesPlacementBundle(t *testing.T) {
-	store := testkit.CreateMockStore(t)
-	tk := newMViewTestKit(t, store)
-	tk.MustExec("use test")
-	tk.MustExec("create placement policy mlog_p followers=1")
-	tk.MustExec("alter database test placement policy mlog_p")
-	tk.MustExec("create table t_placement (a int)")
-	tk.MustExec("create materialized view log on t_placement (a)")
-
-	tk.MustQuery("show placement for table `$mlog$t_placement`").CheckContain("TABLE test.$mlog$t_placement")
-	tk.MustQuery("show placement for table `$mlog$t_placement`").CheckContain("FOLLOWERS=1")
-}
-
-func TestCreateMaterializedViewLogAllowsGeneratedColumns(t *testing.T) {
-	store, dom := testkit.CreateMockStoreAndDomain(t)
-	tk := newMViewTestKit(t, store)
-	tk.MustExec("use test")
-	tk.MustExec("CREATE TABLE t_gen (id BIGINT NOT NULL PRIMARY KEY, base BIGINT NOT NULL, gv BIGINT AS (base + 1) VIRTUAL, gs BIGINT AS (base + 2) STORED)")
-	tk.MustExec("CREATE MATERIALIZED VIEW LOG ON t_gen (id, gv, gs)")
-
-	tk.MustQuery("select column_name from information_schema.columns where table_schema='test' and table_name='$mlog$t_gen' order by ordinal_position").
-		Check(testkit.Rows("id", "gv", "gs", "_MLOG$_DML_TYPE", "_MLOG$_OLD_NEW"))
-
-	is := dom.InfoSchema()
-	mlogTable, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("$mlog$t_gen"))
-	require.NoError(t, err)
-	require.NotNil(t, mlogTable.Meta().MaterializedViewLog)
-	require.Equal(t, []ast.CIStr{ast.NewCIStr("id"), ast.NewCIStr("gv"), ast.NewCIStr("gs")}, mlogTable.Meta().MaterializedViewLog.Columns)
-}
-
-func TestCreateMaterializedViewRejectsUnsupportedSelectClauses(t *testing.T) {
-	store := testkit.CreateMockStore(t)
-	tk := newMViewTestKit(t, store)
-	tk.MustExec("use test")
-	tk.MustExec("create table t (a int not null, b int not null)")
-	tk.MustExec("create materialized view log on t (a, b)")
-
-	tests := []struct {
-		name    string
-		sql     string
-		errPart string
-	}{
-		{
-			name:    "cte",
-			sql:     "create materialized view mv_cte (a, s, cnt) as with cte as (select a from t) select a, sum(b), count(1) from t group by a",
-			errPart: "common table expressions",
-		},
-		{
-			name:    "locking clause",
-			sql:     "create materialized view mv_lock (a, s, cnt) as select a, sum(b), count(1) from t group by a for update",
-			errPart: "locking clauses",
-		},
-		{
-			name:    "select into",
-			sql:     "create materialized view mv_into (a, s, cnt) as select a, sum(b), count(1) from t group by a into outfile '/tmp/mv.out'",
-			errPart: "SELECT INTO",
-		},
-		{
-			name:    "as of",
-			sql:     "create materialized view mv_as_of (a, s, cnt) as select a, sum(b), count(1) from t as of timestamp now() group by a",
-			errPart: "AS OF",
-		},
-		{
-			name:    "table sample",
-			sql:     "create materialized view mv_sample (a, s, cnt) as select a, sum(b), count(1) from t tablesample system (50) group by a",
-			errPart: "TABLESAMPLE",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := tk.ExecToErr(tt.sql)
-			require.ErrorContains(t, err, tt.errPart)
-		})
-	}
-}
-
-func TestCreateTableLikeShouldNotCarryMaterializedViewMetadata(t *testing.T) {
-	store, dom := testkit.CreateMockStoreAndDomain(t)
-	tk := newMViewTestKit(t, store)
-	tk.MustExec("use test")
-	tk.MustExec("create table t (a int not null, b int not null)")
-	tk.MustExec("insert into t values (1, 10), (1, 5), (2, 7)")
-	tk.MustExec("create materialized view log on t (a, b) purge next date_add(now(), interval 1 hour)")
-	tk.MustExec("create materialized view mv_src (a, s, cnt) refresh fast next date_add(now(), interval 1 hour) as select a, sum(b), count(1) from t group by a")
-	tk.MustExec("create table t_like like t")
-	tk.MustExec("create table mv_like like mv_src")
-	tk.MustExec("create table mlog_like like `$mlog$t`")
-
-	is := dom.InfoSchema()
-	baseTable, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t"))
-	require.NoError(t, err)
-	mvSrc, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("mv_src"))
-	require.NoError(t, err)
-	mvLike, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("mv_like"))
-	require.NoError(t, err)
-	mlogSrc, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("$mlog$t"))
-	require.NoError(t, err)
-	mlogLike, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("mlog_like"))
-	require.NoError(t, err)
-
-	require.NotNil(t, mvSrc.Meta().MaterializedView)
-	require.NotNil(t, mlogSrc.Meta().MaterializedViewLog)
-	for _, tbl := range []*model.TableInfo{mvLike.Meta(), mlogLike.Meta()} {
-		require.Nil(t, tbl.MaterializedView)
-		require.Nil(t, tbl.MaterializedViewLog)
-		require.Nil(t, tbl.MaterializedViewBase)
-	}
-	require.NotNil(t, baseTable.Meta().MaterializedViewBase)
-	require.Equal(t, mlogSrc.Meta().ID, baseTable.Meta().MaterializedViewBase.MLogID)
-	require.Equal(t, []int64{mvSrc.Meta().ID}, baseTable.Meta().MaterializedViewBase.MViewIDs)
-}
-
-func TestCreateMaterializedViewRefreshInfoNextUnixSecondsDerivation(t *testing.T) {
-	store, dom := testkit.CreateMockStoreAndDomain(t)
-	tk := newMViewTestKit(t, store)
-	tk.MustExec("use test")
-	tk.MustExec("create table t (a int not null, b int not null)")
-	tk.MustExec("insert into t values (1, 10), (1, 5), (2, 7)")
-	tk.MustExec("create materialized view log on t (a, b) purge next date_add(now(), interval 1 hour)")
-
-	getMViewID := func(name string) int64 {
-		is := dom.InfoSchema()
-		mvTable, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr(name))
-		require.NoError(t, err)
-		return mvTable.Meta().ID
-	}
-
-	tk.MustExec("create materialized view mv_start_only (a, s, cnt) refresh fast start with date_add(now(), interval 40 minute) next date_add(now(), interval 20 minute) as select a, sum(b), count(1) from t group by a")
-	mvStartOnlyID := getMViewID("mv_start_only")
-	tk.MustQuery(fmt.Sprintf(
-		"select NEXT_REFRESH_UNIX_SECONDS is not null, NEXT_REFRESH_UNIX_SECONDS > TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP() + interval 30 minute), NEXT_REFRESH_UNIX_SECONDS < TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP() + interval 2 hour) from mysql.tidb_mview_refresh_info where MVIEW_ID = %d",
-		mvStartOnlyID,
-	)).Check(testkit.Rows("1 1 1"))
-
-	tk.MustExec("create materialized view mv_next_only (a, s, cnt) refresh fast next date_add(now(), interval 20 minute) as select a, sum(b), count(1) from t group by a")
-	mvNextOnlyID := getMViewID("mv_next_only")
-	tk.MustQuery(fmt.Sprintf(
-		"select NEXT_REFRESH_UNIX_SECONDS is not null, NEXT_REFRESH_UNIX_SECONDS > TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP() + interval 10 minute), NEXT_REFRESH_UNIX_SECONDS < TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP() + interval 1 hour) from mysql.tidb_mview_refresh_info where MVIEW_ID = %d",
-		mvNextOnlyID,
-	)).Check(testkit.Rows("1 1 1"))
-
-	tk.MustExec("create materialized view mv_no_schedule (a, s, cnt) refresh fast as select a, sum(b), count(1) from t group by a")
-	mvNoScheduleID := getMViewID("mv_no_schedule")
-	tk.MustQuery(fmt.Sprintf("select NEXT_REFRESH_UNIX_SECONDS is null from mysql.tidb_mview_refresh_info where MVIEW_ID = %d", mvNoScheduleID)).Check(testkit.Rows("1"))
-
-	tk.MustExec("create materialized view mv_near_now (a, s, cnt) refresh fast start with now() next date_add(now(), interval 40 minute) as select a, sum(b), count(1) from t group by a")
-	mvNearNowID := getMViewID("mv_near_now")
-	tk.MustQuery(fmt.Sprintf(
-		"select NEXT_REFRESH_UNIX_SECONDS is not null, NEXT_REFRESH_UNIX_SECONDS > TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP() + interval 20 minute), NEXT_REFRESH_UNIX_SECONDS < TIMESTAMPDIFF(SECOND, '1970-01-01 00:00:00', UTC_TIMESTAMP() + interval 2 hour) from mysql.tidb_mview_refresh_info where MVIEW_ID = %d",
-		mvNearNowID,
-	)).Check(testkit.Rows("1 1 1"))
-}
-
-func TestCreateMaterializedViewRefreshInfoNextUnixSecondsUsesScheduleTimeZone(t *testing.T) {
-	store, dom := testkit.CreateMockStoreAndDomain(t)
-	tk := newMViewTestKit(t, store)
-	tk.MustExec("use test")
-	tk.MustExec("set time_zone = '+08:00'")
-	tk.MustExec("create table t (a int not null, b int not null)")
-	tk.MustExec("insert into t values (1, 10), (1, 5), (2, 7)")
-	tk.MustExec("create materialized view log on t (a, b) purge next date_add(now(), interval 1 hour)")
-
-	getMViewID := func(name string) int64 {
-		is := dom.InfoSchema()
-		mvTable, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr(name))
-		require.NoError(t, err)
-		return mvTable.Meta().ID
-	}
-
-	tk.MustExec("create materialized view mv_schedule_next (a, s, cnt) refresh fast next cast('2030-01-02 10:00:00' as datetime) as select a, sum(b), count(1) from t group by a")
-	mvID := getMViewID("mv_schedule_next")
-	tk.MustQuery(fmt.Sprintf(
-		"select NEXT_REFRESH_UNIX_SECONDS = 1893549600, NEXT_REFRESH_UNIX_SECONDS = 1893578400 from mysql.tidb_mview_refresh_info where MVIEW_ID = %d",
-		mvID,
-	)).Check(testkit.Rows("1 0"))
-
-	tk.MustExec("create materialized view mv_schedule_start (a, s, cnt) refresh fast start with cast('2030-01-02 10:00:00' as datetime) next cast('2030-01-03 10:00:00' as datetime) as select a, sum(b), count(1) from t group by a")
-	mvStartID := getMViewID("mv_schedule_start")
-	tk.MustQuery(fmt.Sprintf(
-		"select NEXT_REFRESH_UNIX_SECONDS = 1893549600, NEXT_REFRESH_UNIX_SECONDS = 1893636000 from mysql.tidb_mview_refresh_info where MVIEW_ID = %d",
-		mvStartID,
-	)).Check(testkit.Rows("1 0"))
-}
-
-func TestCreateMaterializedViewRejectNonBaseObject(t *testing.T) {
-	store := testkit.CreateMockStore(t)
-	tk := newMViewTestKit(t, store)
-	tk.MustExec("use test")
-	tk.MustExec("create table t (a int)")
-	tk.MustExec("create materialized view log on t (a)")
-	tk.MustExec("create view v as select a from t")
-
-	err := tk.ExecToErr("create materialized view mv_v (a, c) as select a, count(1) from v group by a")
-	require.ErrorContains(t, err, "is not BASE TABLE")
 }
 
 func TestCreateMaterializedViewBuildFailureRollback(t *testing.T) {
@@ -460,6 +122,266 @@ func TestCreateMaterializedViewRollbackIgnoreMissingRefreshInfoTable(t *testing.
 	require.Empty(t, baseTable.Meta().MaterializedViewBase.MViewIDs)
 }
 
+func TestCreateMaterializedViewRollbackRefreshInfoFailureRollsBackMetadata(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := newMViewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("create table t_create_mv_rollback_atomic (a int not null, b int not null)")
+	tk.MustExec("create materialized view log on t_create_mv_rollback_atomic (a, b) purge next date_add(now(), interval 1 hour)")
+
+	is := dom.InfoSchema()
+	dbInfo, ok := is.SchemaByName(ast.NewCIStr("test"))
+	require.True(t, ok)
+	baseTable, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t_create_mv_rollback_atomic"))
+	require.NoError(t, err)
+
+	const buildErrFP = "github.com/pingcap/tidb/pkg/ddl/mockCreateMaterializedViewBuildErr"
+	const cleanupErrFP = "github.com/pingcap/tidb/pkg/ddl/mockDeleteCreateMaterializedViewRefreshInfoErr"
+	require.NoError(t, failpoint.Enable(buildErrFP, "return"))
+	require.NoError(t, failpoint.Enable(cleanupErrFP, `1*return("mock refresh info delete error")`))
+	defer func() {
+		require.NoError(t, failpoint.Disable(cleanupErrFP))
+		require.NoError(t, failpoint.Disable(buildErrFP))
+	}()
+
+	retryStarted := make(chan struct{})
+	allowRetry := make(chan struct{})
+	releaseRetry := func() {
+		select {
+		case <-allowRetry:
+		default:
+			close(allowRetry)
+		}
+	}
+	defer releaseRetry()
+	rollbackAttempts := 0
+	var mviewID int64
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/beforeRunOneJobStep", func(job *model.Job) {
+		if job.Type != model.ActionCreateMaterializedView || !job.IsRollingback() {
+			return
+		}
+		rollbackAttempts++
+		if rollbackAttempts != 2 {
+			return
+		}
+		mviewID = job.TableID
+		close(retryStarted)
+		<-allowRetry
+	})
+
+	tkInspect := newMViewTestKit(t, store)
+	tkInspect.MustExec("use test")
+	ddlErrCh := make(chan error, 1)
+	go func() {
+		ddlErrCh <- tk.ExecToErr("create materialized view mv_create_rollback_atomic (a, s, cnt) refresh fast next date_add(now(), interval 1 hour) as select a, sum(b), count(1) from t_create_mv_rollback_atomic group by a")
+	}()
+
+	select {
+	case <-retryStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for CREATE MATERIALIZED VIEW rollback retry")
+	}
+	require.NotZero(t, mviewID)
+	tkInspect.MustQuery(fmt.Sprintf("select count(*) from mysql.tidb_mview_refresh_info where mview_id = %d", mviewID)).Check(testkit.Rows("1"))
+	require.NoError(t, kv.RunInNewTxn(context.Background(), store, false, func(_ context.Context, txn kv.Transaction) error {
+		metaMut := meta.NewMutator(txn)
+		persistedMView, err := metaMut.GetTable(dbInfo.ID, mviewID)
+		require.NoError(t, err)
+		require.NotNil(t, persistedMView)
+		persistedBase, err := metaMut.GetTable(dbInfo.ID, baseTable.Meta().ID)
+		require.NoError(t, err)
+		require.NotNil(t, persistedBase.MaterializedViewBase)
+		require.Contains(t, persistedBase.MaterializedViewBase.MViewIDs, mviewID)
+		return nil
+	}))
+
+	require.NoError(t, failpoint.Disable(cleanupErrFP))
+	releaseRetry()
+	require.Error(t, <-ddlErrCh)
+}
+
+func TestCreateMaterializedViewRollbackUpdateSchemaVersionFailureRetries(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	tk := newMViewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("create table t_create_mv_rollback_retry (a int not null, b int not null)")
+	tk.MustExec("create materialized view log on t_create_mv_rollback_retry (a, b) purge next date_add(now(), interval 1 hour)")
+
+	is := dom.InfoSchema()
+	dbInfo, ok := is.SchemaByName(ast.NewCIStr("test"))
+	require.True(t, ok)
+	baseTable, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t_create_mv_rollback_retry"))
+	require.NoError(t, err)
+	mlogTable, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("$mlog$t_create_mv_rollback_retry"))
+	require.NoError(t, err)
+
+	const buildErrFP = "github.com/pingcap/tidb/pkg/ddl/mockCreateMaterializedViewBuildErr"
+	require.NoError(t, failpoint.Enable(buildErrFP, "return"))
+	defer func() {
+		require.NoError(t, failpoint.Disable(buildErrFP))
+	}()
+
+	var updateVersionErrOnce sync.Once
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/beforeUpdateSchemaVersion", func(job *model.Job, err *error) {
+		if job.Type == model.ActionCreateMaterializedView && job.IsRollbackDone() {
+			updateVersionErrOnce.Do(func() {
+				*err = fmt.Errorf("mock materialized view rollback schema version error")
+			})
+		}
+	})
+
+	retryStarted := make(chan struct{})
+	allowRetry := make(chan struct{})
+	releaseRetry := func() {
+		select {
+		case <-allowRetry:
+		default:
+			close(allowRetry)
+		}
+	}
+	defer releaseRetry()
+	rollbackAttempts := 0
+	var mviewID int64
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/beforeRunOneJobStep", func(job *model.Job) {
+		if job.Type != model.ActionCreateMaterializedView || !job.IsRollingback() {
+			return
+		}
+		rollbackAttempts++
+		if rollbackAttempts != 2 {
+			return
+		}
+		mviewID = job.TableID
+		close(retryStarted)
+		<-allowRetry
+	})
+
+	tkInspect := newMViewTestKit(t, store)
+	tkInspect.MustExec("use test")
+	ddlErrCh := make(chan error, 1)
+	go func() {
+		ddlErrCh <- tk.ExecToErr("create materialized view mv_create_rollback_retry (a, s, cnt) refresh fast next date_add(now(), interval 1 hour) as select a, sum(b), count(1) from t_create_mv_rollback_retry group by a")
+	}()
+
+	select {
+	case <-retryStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for CREATE MATERIALIZED VIEW rollback retry")
+	}
+	require.NotZero(t, mviewID)
+	tkInspect.MustQuery(fmt.Sprintf("select count(*) from mysql.tidb_mview_refresh_info where mview_id = %d", mviewID)).Check(testkit.Rows("1"))
+	require.NoError(t, kv.RunInNewTxn(context.Background(), store, false, func(_ context.Context, txn kv.Transaction) error {
+		metaMut := meta.NewMutator(txn)
+		persistedMView, err := metaMut.GetTable(dbInfo.ID, mviewID)
+		require.NoError(t, err)
+		require.NotNil(t, persistedMView)
+		persistedBase, err := metaMut.GetTable(dbInfo.ID, baseTable.Meta().ID)
+		require.NoError(t, err)
+		require.NotNil(t, persistedBase.MaterializedViewBase)
+		require.Contains(t, persistedBase.MaterializedViewBase.MViewIDs, mviewID)
+		persistedMLog, err := metaMut.GetTable(dbInfo.ID, mlogTable.Meta().ID)
+		require.NoError(t, err)
+		require.NotNil(t, persistedMLog.MaterializedViewLog)
+		require.Contains(t, persistedMLog.MaterializedViewLog.DependentMViewIDs, mviewID)
+		return nil
+	}))
+
+	releaseRetry()
+	require.Error(t, <-ddlErrCh)
+	tk.MustQuery("show tables like 'mv_create_rollback_retry'").Check(testkit.Rows())
+	tk.MustExec("drop materialized view log on t_create_mv_rollback_retry")
+}
+
+func TestCreateMaterializedViewRollbackRechecksJobMetaAfterReopenTxn(t *testing.T) {
+	store := testkit.CreateMockStore(t)
+	tk := newMViewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("create table t_create_mv_recheck_job_meta (a int not null, b int not null)")
+	tk.MustExec("create materialized view log on t_create_mv_recheck_job_meta (a, b) purge next date_add(now(), interval 1 hour)")
+
+	const buildErrFP = "github.com/pingcap/tidb/pkg/ddl/mockCreateMaterializedViewBuildErr"
+	require.NoError(t, failpoint.Enable(buildErrFP, "return"))
+	defer func() {
+		require.NoError(t, failpoint.Disable(buildErrFP))
+	}()
+
+	var updateVersionErrOnce sync.Once
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/beforeUpdateSchemaVersion", func(job *model.Job, err *error) {
+		if job.Type == model.ActionCreateMaterializedView && job.IsRollbackDone() {
+			updateVersionErrOnce.Do(func() {
+				*err = fmt.Errorf("mock materialized view rollback schema version error")
+			})
+		}
+	})
+
+	tkConcurrent := newMViewTestKit(t, store)
+	var expectedErrorCount int64
+	concurrentUpdateDone := make(chan struct{})
+	var concurrentUpdateOnce sync.Once
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/afterRollbackTxnForMustRollbackTxnOnError", func(job *model.Job) {
+		if job.Type != model.ActionCreateMaterializedView || !job.IsRollingback() {
+			return
+		}
+		concurrentUpdateOnce.Do(func() {
+			jobBytes, err := job.Encode(false)
+			require.NoError(t, err)
+			concurrentJob := &model.Job{}
+			require.NoError(t, concurrentJob.Decode(jobBytes))
+			concurrentJob.ErrorCount++
+			expectedErrorCount = concurrentJob.ErrorCount
+			updatedJobBytes, err := concurrentJob.Encode(false)
+			require.NoError(t, err)
+			tkConcurrent.MustExec(fmt.Sprintf(
+				"update mysql.tidb_ddl_job set job_meta = %s where job_id = %d",
+				ddlutil.WrapKey2String(updatedJobBytes), job.ID,
+			))
+			close(concurrentUpdateDone)
+		})
+	})
+
+	retryStarted := make(chan struct{})
+	allowRetry := make(chan struct{})
+	releaseRetry := func() {
+		select {
+		case <-allowRetry:
+		default:
+			close(allowRetry)
+		}
+	}
+	defer releaseRetry()
+	var retryOnce sync.Once
+	testfailpoint.EnableCall(t, "github.com/pingcap/tidb/pkg/ddl/beforeRunOneJobStep", func(job *model.Job) {
+		if job.Type != model.ActionCreateMaterializedView || !job.IsRollingback() {
+			return
+		}
+		select {
+		case <-concurrentUpdateDone:
+		default:
+			return
+		}
+		if job.ErrorCount != expectedErrorCount {
+			return
+		}
+		retryOnce.Do(func() {
+			close(retryStarted)
+			<-allowRetry
+		})
+	})
+
+	ddlErrCh := make(chan error, 1)
+	go func() {
+		ddlErrCh <- tk.ExecToErr("create materialized view mv_create_recheck_job_meta (a, s, cnt) refresh fast next date_add(now(), interval 1 hour) as select a, sum(b), count(1) from t_create_mv_recheck_job_meta group by a")
+	}()
+
+	select {
+	case <-retryStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timeout waiting for CREATE MATERIALIZED VIEW retry with concurrent job metadata")
+	}
+
+	releaseRetry()
+	require.Error(t, <-ddlErrCh)
+}
+
 func TestCreateMaterializedViewRefreshInfoUpsertFailureRollback(t *testing.T) {
 	store, dom := testkit.CreateMockStoreAndDomain(t)
 	tk := newMViewTestKit(t, store)
@@ -491,29 +413,6 @@ func TestCreateMaterializedViewRefreshInfoUpsertFailureRollback(t *testing.T) {
 	require.NotNil(t, baseTable.Meta().MaterializedViewBase)
 	require.NotZero(t, baseTable.Meta().MaterializedViewBase.MLogID)
 	require.Empty(t, baseTable.Meta().MaterializedViewBase.MViewIDs)
-}
-
-func TestCreateMaterializedViewLogPurgeInfoFailureRollback(t *testing.T) {
-	store, dom := testkit.CreateMockStoreAndDomain(t)
-	tk := newMViewTestKit(t, store)
-	tk.MustExec("use test")
-	tk.MustExec("create table t (a int not null, b int not null)")
-
-	const failpointName = "github.com/pingcap/tidb/pkg/ddl/mockInsertMLogPurgeTableNotExists"
-	require.NoError(t, failpoint.Enable(failpointName, "return(true)"))
-	defer func() {
-		require.NoError(t, failpoint.Disable(failpointName))
-	}()
-
-	err := tk.ExecToErr("create materialized view log on t (a, b) purge next date_add(now(), interval 1 hour)")
-	require.ErrorContains(t, err, "tidb_mlog_purge_info")
-	tk.MustQuery("show tables like '$mlog$t'").Check(testkit.Rows())
-	tk.MustQuery("select count(*) from mysql.tidb_mlog_purge_info").Check(testkit.Rows("0"))
-
-	is := dom.InfoSchema()
-	baseTable, err := is.TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t"))
-	require.NoError(t, err)
-	require.Nil(t, baseTable.Meta().MaterializedViewBase)
 }
 
 func TestCreateMaterializedViewRetryWithResidualBuildRowsRollback(t *testing.T) {
@@ -568,51 +467,6 @@ func TestCreateMaterializedViewRetryAfterUpsertFailure(t *testing.T) {
 
 	tk.MustExec("create materialized view mv_retry (a, s, cnt) refresh fast next date_add(now(), interval 1 hour) as select a, sum(b), count(1) from t group by a")
 	tk.MustQuery("select a, s, cnt from mv_retry order by a").Check(testkit.Rows("1 15 2", "2 7 1"))
-}
-
-func TestCreateMaterializedViewLogPrivilege(t *testing.T) {
-	store := testkit.CreateMockStore(t)
-	tk := newMViewTestKit(t, store)
-	tk.MustExec("use test")
-	tk.MustExec("create table t_create_mlog_priv (a int)")
-	users := []string{"u_create_mlog_no_create", "u_create_mlog_no_select", "u_create_mlog_table_create", "u_create_mlog_ok"}
-	t.Cleanup(func() {
-		for _, user := range users {
-			tk.MustExec("drop user '" + user + "'@'%'")
-		}
-	})
-	for _, user := range users {
-		tk.MustExec("create user '" + user + "'@'%'")
-	}
-
-	tk.MustExec("grant select on test.t_create_mlog_priv to 'u_create_mlog_no_create'@'%'")
-	tkNoCreate := newMViewTestKit(t, store)
-	require.NoError(t, tkNoCreate.Session().Auth(&auth.UserIdentity{Username: "u_create_mlog_no_create", Hostname: "%"}, nil, nil, nil))
-	err := tkNoCreate.ExecToErr("create materialized view log on test.t_create_mlog_priv (a)")
-	require.ErrorContains(t, err, "CREATE MATERIALIZED VIEW LOG command denied")
-	require.ErrorContains(t, err, "t_create_mlog_priv")
-	require.NotContains(t, err.Error(), "$mlog$")
-
-	tk.MustExec("grant create view on test.* to 'u_create_mlog_no_select'@'%'")
-	tkNoSelect := newMViewTestKit(t, store)
-	require.NoError(t, tkNoSelect.Session().Auth(&auth.UserIdentity{Username: "u_create_mlog_no_select", Hostname: "%"}, nil, nil, nil))
-	err = tkNoSelect.ExecToErr("create materialized view log on test.t_create_mlog_priv (a)")
-	require.ErrorContains(t, err, "SELECT command denied")
-
-	tk.MustExec("grant create view on test.* to 'u_create_mlog_ok'@'%'")
-	tk.MustExec("grant select on test.t_create_mlog_priv to 'u_create_mlog_ok'@'%'")
-	tkOK := newMViewTestKit(t, store)
-	require.NoError(t, tkOK.Session().Auth(&auth.UserIdentity{Username: "u_create_mlog_ok", Hostname: "%"}, nil, nil, nil))
-	tkOK.MustExec("create materialized view log on test.t_create_mlog_priv (a)")
-
-	tk.MustExec("grant create view on test.t_create_mlog_priv to 'u_create_mlog_table_create'@'%'")
-	tk.MustExec("grant select on test.t_create_mlog_priv to 'u_create_mlog_table_create'@'%'")
-	tkTableCreate := newMViewTestKit(t, store)
-	require.NoError(t, tkTableCreate.Session().Auth(&auth.UserIdentity{Username: "u_create_mlog_table_create", Hostname: "%"}, nil, nil, nil))
-	err = tkTableCreate.ExecToErr("create materialized view log on test.t_create_mlog_priv (a)")
-	require.ErrorContains(t, err, "CREATE MATERIALIZED VIEW LOG command denied")
-	require.ErrorContains(t, err, "t_create_mlog_priv")
-	require.NotContains(t, err.Error(), "$mlog$")
 }
 
 func TestCreateMaterializedViewHistoryJobSchemaVersion(t *testing.T) {

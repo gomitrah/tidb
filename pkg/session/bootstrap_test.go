@@ -485,7 +485,7 @@ func TestForIssue23387(t *testing.T) {
 	rows, err := ResultSetToStringSlice(context.Background(), se, rs)
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
-	require.Equal(t, "GRANT USAGE ON *.* TO 'quatest'@'%'", rows[0][0])
+	require.Equal(t, "GRANT USAGE ON *.* TO `quatest`@`%`", rows[0][0])
 }
 
 func TestIndexMergeInNewCluster(t *testing.T) {
@@ -1937,7 +1937,7 @@ func TestVersionedBootstrapSchemas(t *testing.T) {
 	})
 	ctx := kv.WithInternalSourceType(context.Background(), kv.InternalTxnDDL)
 	require.NoError(t, kv.RunInNewTxn(ctx, store, true, func(_ context.Context, txn kv.Transaction) error {
-		return meta.NewMutator(txn).SetNextGenBootTableVersion(meta.MaterializedViewNextGenBootTableVersion)
+		return meta.NewMutator(txn).SetNextGenBootTableVersion(meta.StorageClassTransitionNextGenBootTableVersion - 1)
 	}))
 	require.NoError(t, bootstrapSchemas(store))
 	require.NoError(t, kv.RunInNewTxn(ctx, store, true, func(_ context.Context, txn kv.Transaction) error {
